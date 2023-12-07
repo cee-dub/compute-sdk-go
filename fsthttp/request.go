@@ -99,11 +99,6 @@ type Request struct {
 	ManualFramingMode bool
 
 	sent bool // a request may only be sent once
-
-	abi struct {
-		req  *fastly.HTTPRequest
-		body *fastly.HTTPBody
-	}
 }
 
 // NewRequest constructs an outgoing request with the given HTTP method, URI,
@@ -290,25 +285,37 @@ func (req *Request) AddCookie(c *Cookie) {
 // capabilities, and is recommended for most users who need to cache
 // HTTP responses.
 func (req *Request) Send(ctx context.Context, backend string) (*Response, error) {
-	if req.abi.req == nil && req.abi.body == nil {
-		//  abi request not yet constructed
-		if err := req.constructABIRequest(); err != nil {
-			return nil, err
-		}
+	if req.sent {
+		return nil, fmt.Errorf("request already sent")
 	}
 
-	abiPending, abiReqBody, err := req.sendABIRequestAsync(backend)
+	abiReq, abiReqBody, err := req.constructABIRequest()
 	if err != nil {
-		status, ok := fastly.IsFastlyError(err)
-		if !ok {
-			return nil, err
-		}
+		return nil, err
+	}
 
-		if status == fastly.FastlyStatusInval {
+	req.sent = true
+
+	// When the request's ManualFramingMode is false, SendAsyncStreaming
+	// streams the request body to the backend using "Transfer-Encoding:
+	// chunked".  This is the default behavior we want for requests with
+	// a body.  For requests without a body, we want to avoid
+	// unnecessary chunked encoding, and have observed servers that
+	// error when seeing it in certain contexts.  Calling SendAsync
+	// instead causes the entire body to be buffered (in this case, zero
+	// bytes) and "Content-Length: 0" to be sent instead.
+	var abiPending *fastly.PendingRequest
+	if req.Body == nil {
+		abiPending, err = abiReq.SendAsync(abiReqBody, backend)
+	} else {
+		abiPending, err = abiReq.SendAsyncStreaming(abiReqBody, backend)
+	}
+	if err != nil {
+		if status, ok := fastly.IsFastlyError(err); ok && status == fastly.FastlyStatusInval {
 			return nil, ErrBackendNotFound
 		}
 
-		return nil, err
+		return nil, fmt.Errorf("begin send: %w", err)
 	}
 
 	var (
@@ -371,79 +378,45 @@ func (req *Request) Send(ctx context.Context, backend string) (*Response, error)
 	return resp, nil
 }
 
-func (req *Request) constructABIRequest() error {
-	if req.abi.req != nil || req.abi.body != nil {
-		return fmt.Errorf("request already constructed")
-	}
-
+func (req *Request) constructABIRequest() (*fastly.HTTPRequest, *fastly.HTTPBody, error) {
 	abiReq, err := fastly.NewHTTPRequest()
 	if err != nil {
-		return fmt.Errorf("construct request: %w", err)
+		return nil, nil, fmt.Errorf("construct request: %w", err)
 	}
 
 	if err := abiReq.SetMethod(req.Method); err != nil {
-		return fmt.Errorf("set method: %w", err)
+		return nil, nil, fmt.Errorf("set method: %w", err)
 	}
 
 	if err := abiReq.SetURI(req.URL.String()); err != nil {
-		return fmt.Errorf("set URL: %w", err)
+		return nil, nil, fmt.Errorf("set URL: %w", err)
 	}
 
 	if err := abiReq.SetAutoDecompressResponse(fastly.AutoDecompressResponseOptions(req.DecompressResponseOptions)); err != nil {
-		return fmt.Errorf("set auto decompress response: %w", err)
+		return nil, nil, fmt.Errorf("set auto decompress response: %w", err)
 	}
 
 	if err := abiReq.SetFramingHeadersMode(req.ManualFramingMode); err != nil {
-		return fmt.Errorf("set framing headers mode: %w", err)
+		return nil, nil, fmt.Errorf("set framing headers mode: %w", err)
 	}
 
 	if err := abiReq.SetCacheOverride(fastly.CacheOverrideOptions(req.CacheOptions)); err != nil {
-		return fmt.Errorf("set cache options: %w", err)
+		return nil, nil, fmt.Errorf("set cache options: %w", err)
 	}
 
 	for _, key := range req.Header.Keys() {
 		vals := req.Header.Values(key)
 		if err := abiReq.SetHeaderValues(key, vals); err != nil {
-			return fmt.Errorf("set headers: %w", err)
+			return nil, nil, fmt.Errorf("set headers: %w", err)
 		}
 	}
 
 	abiReqBody, err := abiBodyFrom(req.Body)
 	if err != nil {
-		return fmt.Errorf("get body: %w", err)
+		return nil, nil, fmt.Errorf("get body: %w", err)
 	}
 
-	req.abi.req = abiReq
-	req.abi.body = abiReqBody
-
-	return nil
-}
-
-func (req *Request) sendABIRequestAsync(backend string) (*fastly.PendingRequest, *fastly.HTTPBody, error) {
-	if req.sent {
-		return nil, nil, fmt.Errorf("request already sent")
-	}
-
-	// When the request's ManualFramingMode is false, SendAsyncStreaming
-	// streams the request body to the backend using "Transfer-Encoding:
-	// chunked".  This is the default behavior we want for requests with
-	// a body.  For requests without a body, we want to avoid
-	// unnecessary chunked encoding, and have observed servers that
-	// error when seeing it in certain contexts.  Calling SendAsync
-	// instead causes the entire body to be buffered (in this case, zero
-	// bytes) and "Content-Length: 0" to be sent instead.
-	sendFn := req.abi.req.SendAsyncStreaming
-	if req.Body == nil {
-		sendFn = req.abi.req.SendAsync
-	}
-
-	abiPending, err := sendFn(req.abi.body, backend)
-	if err != nil {
-		return nil, nil, fmt.Errorf("begin send: %w", err)
-	}
-
-	req.sent = true
-	return abiPending, req.abi.body, nil
+	return abiReq, abiReqBody, nil
 }
 
 // CacheOptions control caching behavior for outgoing requests.
