@@ -1,4 +1,5 @@
-// Package erl provides Edge Rate Limiting functionality.
+// Package erl provides Edge Rate Limiting functionality.  This package
+// is released as a community preview.
 //
 // This package includes a [RateCounter] type that can be used to
 // increment an event counter, and to examine the rate of events per
